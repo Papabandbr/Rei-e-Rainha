@@ -1,0 +1,1753 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>REI E RAINHA</title>
+<style>
+  html,body{margin:0;padding:0;background:#000;height:100%;overflow:hidden;}
+  #wrap{display:flex;align-items:center;justify-content:center;height:100%;}
+  canvas{
+    image-rendering:pixelated;
+    image-rendering:crisp-edges;
+    background:#000;
+  }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="game" width="256" height="240"></canvas></div>
+<script>
+"use strict";
+/* ============================================================
+   REI E RAINHA — RPG 8-BITS ESTILO NES
+   Teclado: SETAS/WASD mover | Z / ESPAÇO / ENTER acao/atacar
+   Joystick: D-PAD/analogico mover | A atacar | START iniciar
+   ============================================================ */
+
+const cv = document.getElementById('game');
+const ctx = cv.getContext('2d');
+ctx.imageSmoothingEnabled = false;
+
+function fitCanvas(){
+  const s = Math.max(1, Math.floor(Math.min(window.innerWidth/256, window.innerHeight/240)));
+  cv.style.width = (256*s)+'px';
+  cv.style.height = (240*s)+'px';
+}
+window.addEventListener('resize', fitCanvas); fitCanvas();
+
+/* ---------------- PALETA NES ---------------- */
+const P = {
+  black:'#000000', white:'#fcfcfc', gray:'#7c7c7c', dgray:'#404040', lgray:'#bcbcbc',
+  red:'#d82800', dred:'#881400', orange:'#e45c10', yellow:'#f8b800', cream:'#fce0a8',
+  green:'#00a800', dgreen:'#005800', lgreen:'#58d854', grass:'#388700', grass2:'#2f7000',
+  blue:'#0058f8', dblue:'#0000bc', lblue:'#3cbcfc', sky:'#5c94fc',
+  purple:'#6844fc', dpurple:'#4428bc', pink:'#f878f8',
+  brown:'#88500c', dbrown:'#503000', tan:'#c08840',
+  skin:'#f8b888'
+};
+
+/* ---------------- CONSTANTES ---------------- */
+const TILE=16, COLS=16, ROWS=13, HUD_H=32, PXW=256, PXH=240;
+const PLAY_Y = HUD_H;
+const HERO_SPEED=72, BAT_SPEED=88, GOB_SPEED=32, FIRE_SPEED=110, VAMP_SPEED=22;
+const RESPAWN_MS=120000;
+
+/* ---------------- ENTRADA ---------------- */
+const keys={};
+let actionPressed=false, startPressed=false;
+let prevAction=false, prevStart=false;
+window.addEventListener('keydown',e=>{
+  if(['ArrowUp','ArrowDown','ArrowLeft','ArrowRight',' '].includes(e.key)) e.preventDefault();
+  keys[e.key.toLowerCase()]=true;
+  unlockAudio();
+});
+window.addEventListener('keyup',e=>{ keys[e.key.toLowerCase()]=false; });
+window.addEventListener('gamepadconnected',()=>{ unlockAudio(); });
+
+function readInput(){
+  let up=keys['arrowup']||keys['w'], dn=keys['arrowdown']||keys['s'],
+      lf=keys['arrowleft']||keys['a'], rt=keys['arrowright']||keys['d'];
+  let act=keys['z']||keys[' ']||keys['enter'], st=keys['enter'];
+  const gps=navigator.getGamepads?navigator.getGamepads():[];
+  for(const g of gps){
+    if(!g) continue;
+    if(g.buttons[12]&&g.buttons[12].pressed) up=true;
+    if(g.buttons[13]&&g.buttons[13].pressed) dn=true;
+    if(g.buttons[14]&&g.buttons[14].pressed) lf=true;
+    if(g.buttons[15]&&g.buttons[15].pressed) rt=true;
+    if(g.axes[0]<-0.4) lf=true; if(g.axes[0]>0.4) rt=true;
+    if(g.axes[1]<-0.4) up=true; if(g.axes[1]>0.4) dn=true;
+    for(let i=0;i<4;i++) if(g.buttons[i]&&g.buttons[i].pressed){ act=true; unlockAudio(); }
+    if(g.buttons[9]&&g.buttons[9].pressed){ st=true; act=true; unlockAudio(); }
+  }
+  actionPressed = act && !prevAction;
+  startPressed = (act||st) && !prevStart;
+  prevAction = act; prevStart = (act||st);
+  return {up,dn,lf,rt};
+}
+
+/* ---------------- AUDIO (chiptune) ---------------- */
+let AC=null, masterGain=null, noiseBuf=null;
+function initAudioContext(){
+  if(AC) return;
+  try{
+    AC = new (window.AudioContext||window.webkitAudioContext)();
+    masterGain = AC.createGain(); masterGain.gain.value=0.18; masterGain.connect(AC.destination);
+    noiseBuf = AC.createBuffer(1, AC.sampleRate*1, AC.sampleRate);
+    const d=noiseBuf.getChannelData(0);
+    for(let i=0;i<d.length;i++) d[i]=Math.random()*2-1;
+  }catch(e){}
+}
+function unlockAudio(){
+  if(!AC) initAudioContext();
+  if(AC && AC.state==='suspended') AC.resume().then(()=>{ if(!music.name) setMusic('title'); });
+}
+// Tenta iniciar o AudioContext imediatamente ao carregar a página
+(function(){
+  try{
+    initAudioContext();
+    if(AC && AC.state==='running'){
+      // Navegador permitiu sem interação — agenda música do título
+      setTimeout(()=>{ if(!music.name) setMusic('title'); }, 100);
+    }
+  }catch(e){}
+})();
+// Escuta qualquer interação para desbloquear e iniciar a música
+['click','keydown','touchstart','pointerdown'].forEach(ev=>{
+  document.addEventListener(ev, function handler(){
+    unlockAudio();
+    if(AC && AC.state==='running' && !music.name) setMusic('title');
+    document.removeEventListener(ev, handler);
+  }, {once:true});
+});
+function midi(n){ return 440*Math.pow(2,(n-69)/12); }
+function tone(freq,t,dur,type,vol,dest){
+  if(!AC) return;
+  const o=AC.createOscillator(), g=AC.createGain();
+  o.type=type; o.frequency.value=freq;
+  const atk=0.008, rel=Math.min(0.08,dur*0.4);
+  g.gain.setValueAtTime(0.0001,t);
+  g.gain.exponentialRampToValueAtTime(vol,t+atk);
+  g.gain.setValueAtTime(vol,t+Math.max(atk,dur-rel));
+  g.gain.exponentialRampToValueAtTime(0.0008,t+dur);
+  o.connect(g); g.connect(dest||masterGain);
+  o.start(t); o.stop(t+dur+0.03);
+}
+// voz de melodia com leve vibrato e segundo oscilador (detune) -> mais encorpado
+function voiceMel(freq,t,dur,vol){
+  if(!AC) return;
+  const g=AC.createGain();
+  g.gain.setValueAtTime(0.0001,t);
+  g.gain.exponentialRampToValueAtTime(vol,t+0.01);
+  g.gain.setValueAtTime(vol,t+Math.max(0.01,dur-0.06));
+  g.gain.exponentialRampToValueAtTime(0.0008,t+dur);
+  g.connect(masterGain);
+  const o1=AC.createOscillator(); o1.type='square'; o1.frequency.value=freq;
+  const o2=AC.createOscillator(); o2.type='square'; o2.frequency.value=freq; o2.detune.value=7;
+  // vibrato sutil
+  if(dur>0.28){
+    const lfo=AC.createOscillator(), lg=AC.createGain();
+    lfo.frequency.value=5.5; lg.gain.value=freq*0.006;
+    lfo.connect(lg); lg.connect(o1.frequency); lg.connect(o2.frequency);
+    lfo.start(t+0.12); lfo.stop(t+dur);
+  }
+  o1.connect(g); o2.connect(g);
+  o1.start(t); o1.stop(t+dur+0.03);
+  o2.start(t); o2.stop(t+dur+0.03);
+}
+
+function voiceStrings(freq,t,dur,vol){
+  if(!AC) return;
+  const g=AC.createGain();
+  g.gain.setValueAtTime(0.0001,t);
+  g.gain.linearRampToValueAtTime(vol,t+0.08);
+  g.gain.linearRampToValueAtTime(0.0001,t+dur);
+  const o1=AC.createOscillator();
+  const o2=AC.createOscillator();
+  o1.type='triangle';
+  o2.type='triangle';
+  o1.frequency.value=freq;
+  o2.frequency.value=freq*0.5;
+  o1.connect(g);
+  o2.connect(g);
+  g.connect(masterGain);
+  o1.start(t); o2.start(t);
+  o1.stop(t+dur);
+  o2.stop(t+dur);
+}
+function noiseHit(t,dur,vol,freq){
+  if(!AC) return;
+  const s=AC.createBufferSource(); s.buffer=noiseBuf; s.loop=true;
+  const f=AC.createBiquadFilter(); f.type='lowpass'; f.frequency.value=freq||1200;
+  const g=AC.createGain();
+  g.gain.setValueAtTime(vol,t);
+  g.gain.exponentialRampToValueAtTime(0.001,t+dur);
+  s.connect(f); f.connect(g); g.connect(masterGain);
+  s.start(t); s.stop(t+dur+0.05);
+}
+// percussao chiptune leve
+function drumHit(t,kind){
+  if(!AC) return;
+  if(kind==='kick'){
+    const o=AC.createOscillator(), g=AC.createGain();
+    o.type='sine'; o.frequency.setValueAtTime(120,t); o.frequency.exponentialRampToValueAtTime(45,t+0.12);
+    g.gain.setValueAtTime(0.32,t); g.gain.exponentialRampToValueAtTime(0.001,t+0.14);
+    o.connect(g); g.connect(masterGain); o.start(t); o.stop(t+0.16);
+  } else if(kind==='hat'){
+    noiseHit(t,0.04,0.06,7000);
+  } else if(kind==='snare'){
+    noiseHit(t,0.09,0.12,3000);
+  }
+}
+
+/* --- musicas ---
+   mel/bass/arp: [[midi(0=pausa), beats]]
+   drums: string por beat -> k=kick s=snare h=hat .=silencio  */
+const SONGS={
+  title:{tempo:94,
+    mel:[[69,1.5],[72,0.5],[71,1],[69,1],[76,2],[74,1],[72,1],[71,3],[0,1],
+         [69,1.5],[72,0.5],[71,1],[69,1],[74,2],[76,1],[77,1],[76,3],[0,1],
+         [81,2],[79,1],[77,1],[76,2],[74,1],[72,1],[71,2],[72,1],[74,1],[69,4]],
+    bass:[[45,2],[45,2],[41,2],[41,2],[48,2],[48,2],[43,2],[43,2],
+          [45,2],[45,2],[41,2],[41,2],[50,2],[50,2],[52,2],[52,2],
+          [41,2],[41,2],[48,2],[48,2],[43,2],[43,2],[45,4]],
+    arp:[[69,0.5],[76,0.5],[81,0.5],[76,0.5],[65,0.5],[72,0.5],[77,0.5],[72,0.5],
+         [60,0.5],[67,0.5],[72,0.5],[67,0.5],[64,0.5],[71,0.5],[76,0.5],[71,0.5]],
+    drums:"k...h...s...h..."},
+  village:{tempo:124,
+    mel:[[76,0.5],[79,0.5],[84,1],[79,0.5],[76,0.5],[72,1],[74,0.5],[76,0.5],[77,1],[74,1],
+         [76,0.5],[74,0.5],[72,1],[69,0.5],[72,0.5],[76,2],[0,1],
+         [77,0.5],[81,0.5],[84,1],[81,0.5],[77,0.5],[74,1],[76,0.5],[77,0.5],[79,1],[76,1],[72,2],[0,1]],
+    bass:[[48,1],[55,1],[52,1],[55,1],[48,1],[55,1],[52,1],[55,1],
+          [45,1],[52,1],[48,1],[52,1],[43,1],[50,1],[47,1],[50,1]],
+    arp:[[72,0.5],[76,0.5],[79,0.5],[76,0.5],[72,0.5],[76,0.5],[79,0.5],[76,0.5],
+         [69,0.5],[72,0.5],[76,0.5],[72,0.5],[67,0.5],[71,0.5],[74,0.5],[71,0.5]],
+    drums:"k...h...s...h..."},
+  action:{tempo:168,
+    mel:[[76,0.5],[76,0.5],[79,0.5],[76,0.5],[74,0.5],[76,1],[71,0.5],[74,0.5],
+         [76,0.5],[79,0.5],[83,1],[79,0.5],[76,0.5],[74,1],
+         [72,0.5],[76,0.5],[79,0.5],[76,0.5],[74,0.5],[71,0.5],[69,1],[71,0.5],[74,0.5],[76,2]],
+    bass:[[40,0.5],[40,0.5],[47,0.5],[40,0.5],[40,0.5],[47,0.5],[40,0.5],[47,0.5],
+          [38,0.5],[38,0.5],[45,0.5],[38,0.5],[36,0.5],[36,0.5],[43,0.5],[36,0.5]],
+    arp:[[64,0.25],[71,0.25],[76,0.25],[79,0.25],[64,0.25],[71,0.25],[76,0.25],[79,0.25],
+         [62,0.25],[69,0.25],[74,0.25],[78,0.25],[60,0.25],[67,0.25],[72,0.25],[76,0.25]],
+    drums:"k.hsk.hsk.hsk.hs"},
+  castle:{tempo:88,
+    mel:[[57,2],[58,2],[57,2],[54,2],[57,2],[63,2],[58,2],[51,3],[0,1],
+         [57,2],[60,2],[58,2],[55,2],[54,2],[51,2],[50,3],[0,1]],
+    bass:[[33,4],[34,4],[33,4],[30,4],[33,4],[36,4],[31,4],[26,4]],
+    arp:[[45,1],[52,1],[57,1],[52,1],[46,1],[53,1],[58,1],[53,1],
+         [45,1],[52,1],[57,1],[52,1],[42,1],[49,1],[54,1],[49,1]],
+    drums:"k..h..s..h..k.."},
+  boss:{tempo:172,
+    mel:[[64,0.5],[63,0.5],[64,0.5],[67,0.5],[64,0.5],[63,0.5],[61,0.5],[63,0.5],
+         [64,0.5],[67,0.5],[70,0.5],[67,0.5],[64,0.5],[63,0.5],[61,1],
+         [69,0.5],[68,0.5],[69,0.5],[72,0.5],[69,0.5],[67,0.5],[64,0.5],[63,0.5],[61,2]],
+    bass:[[40,0.5],[46,0.5],[40,0.5],[46,0.5],[40,0.5],[46,0.5],[40,0.5],[46,0.5],
+          [38,0.5],[44,0.5],[38,0.5],[44,0.5],[36,0.5],[42,0.5],[38,0.5],[40,0.5]],
+    arp:[[52,0.25],[59,0.25],[64,0.25],[67,0.25],[52,0.25],[59,0.25],[64,0.25],[67,0.25],
+         [50,0.25],[57,0.25],[62,0.25],[65,0.25],[48,0.25],[55,0.25],[60,0.25],[64,0.25]],
+    drums:"kshskshskshskshs"}
+};
+
+const music={ song:null, name:null, melIdx:0, bassIdx:0, arpIdx:0, drumIdx:0, melT:0, bassT:0, arpT:0, drumT:0, timer:null, muted:false };
+function setMusic(name){
+  if(music.name===name) return;
+  music.name=name;
+  music.song = name?SONGS[name]:null;
+  music.melIdx=0; music.bassIdx=0; music.arpIdx=0; music.drumIdx=0;
+  if(AC){ const t=AC.currentTime; music.melT=t; music.bassT=t; music.arpT=t; music.drumT=t; }
+}
+function musicTick(){
+  if(!AC || !music.song || music.muted) return;
+  const s=music.song, beat=60/s.tempo, ahead=AC.currentTime+0.3;
+  // melodia (voz encorpada)
+  while(music.melT<ahead){
+    const [n,b]=s.mel[music.melIdx%s.mel.length];
+    if(n>0) voiceMel(midi(n),music.melT,Math.min(b*beat*0.92,0.7),0.15);
+    music.melT+=b*beat; music.melIdx++;
+  }
+  // baixo
+  while(music.bassT<ahead){
+    const [n,b]=s.bass[music.bassIdx%s.bass.length];
+    if(n>0){ tone(midi(n),music.bassT,b*beat*0.9,'triangle',0.30);
+             tone(midi(n),music.bassT,b*beat*0.5,'square',0.05); }
+    music.bassT+=b*beat; music.bassIdx++;
+  }
+  // arpejo / harmonia
+  if(s.arp) while(music.arpT<ahead){
+    const [n,b]=s.arp[music.arpIdx%s.arp.length];
+    if(n>0) tone(midi(n),music.arpT,Math.min(b*beat*0.7,0.18),'square',0.055);
+    music.arpT+=b*beat; music.arpIdx++;
+  }
+  // bateria (1 simbolo por beat)
+  if(s.drums) while(music.drumT<ahead){
+    const ch=s.drums[music.drumIdx%s.drums.length];
+    if(ch==='k') drumHit(music.drumT,'kick');
+    else if(ch==='s'){ drumHit(music.drumT,'snare'); drumHit(music.drumT,'kick'); }
+    else if(ch==='h') drumHit(music.drumT,'hat');
+    music.drumT+=beat; music.drumIdx++;
+  }
+}
+setInterval(musicTick,50);
+
+/* --- efeitos sonoros --- */
+function sfxSwing(){ if(!AC)return; const t=AC.currentTime;
+  const o=AC.createOscillator(),g=AC.createGain();
+  o.type='square'; o.frequency.setValueAtTime(700,t); o.frequency.exponentialRampToValueAtTime(180,t+0.09);
+  g.gain.setValueAtTime(0.15,t); g.gain.exponentialRampToValueAtTime(0.001,t+0.1);
+  o.connect(g);g.connect(masterGain);o.start(t);o.stop(t+0.12);}
+function sfxEnemyHit(){ if(!AC)return; tone(200,AC.currentTime,0.08,'square',0.18); }
+function sfxEnemyDie(){ if(!AC)return; const t=AC.currentTime;
+  tone(midi(64),t,0.07,'square',0.16); tone(midi(57),t+0.07,0.07,'square',0.16); tone(midi(52),t+0.14,0.12,'square',0.16);
+  noiseHit(t,0.15,0.12,900);}
+function sfxHurt(){ if(!AC)return; const t=AC.currentTime;
+  tone(midi(50),t,0.1,'sawtooth',0.2); tone(midi(44),t+0.08,0.14,'sawtooth',0.18); noiseHit(t,0.12,0.12,500);}
+function sfxPickup(){ if(!AC)return; const t=AC.currentTime;
+  tone(midi(84),t,0.06,'square',0.15); tone(midi(88),t+0.06,0.1,'square',0.15);}
+function sfxHeart(){ if(!AC)return; const t=AC.currentTime;
+  tone(midi(76),t,0.06,'square',0.14); tone(midi(83),t+0.06,0.12,'square',0.14);}
+function sfxMystery(){ if(!AC)return; const t=AC.currentTime;
+  [73,74,76,79,83,88].forEach((n,i)=>tone(midi(n),t+i*0.1,0.12,'square',0.18));}
+function sfxFanfare(){ if(!AC)return; const t=AC.currentTime;
+  [[72,0.13],[72,0.13],[72,0.13],[76,0.3],[74,0.13],[76,0.45]].reduce((tt,[n,d])=>{
+    tone(midi(n),tt,d*0.95,'square',0.2); tone(midi(n-12),tt,d*0.95,'triangle',0.2); return tt+d;},t);}
+function sfxUnlock(){ if(!AC)return; const t=AC.currentTime;
+  tone(120,t,0.1,'square',0.2); tone(240,t+0.12,0.15,'square',0.2);}
+function sfxExplosion(){ if(!AC)return; const t=AC.currentTime;
+  noiseHit(t,0.8,0.4,700); noiseHit(t+0.1,0.7,0.3,300);
+  tone(60,t,0.6,'sawtooth',0.25);}
+function sfxText(){ if(!AC)return; tone(880,AC.currentTime,0.03,'square',0.06); }
+function sfxFire(){ if(!AC)return; const t=AC.currentTime;
+  const o=AC.createOscillator(),g=AC.createGain();
+  o.type='sawtooth'; o.frequency.setValueAtTime(300,t); o.frequency.exponentialRampToValueAtTime(90,t+0.2);
+  g.gain.setValueAtTime(0.12,t); g.gain.exponentialRampToValueAtTime(0.001,t+0.22);
+  o.connect(g);g.connect(masterGain);o.start(t);o.stop(t+0.25);}
+function sfxPush(){ if(!AC)return; noiseHit(AC.currentTime,0.1,0.12,350); }
+function sfxFail(){ if(!AC)return; const t=AC.currentTime;
+  // Melodia descendente de "falha" estilo chiptune (1 segundo)
+  tone(midi(60),t+0.00,0.18,'sawtooth',0.22);
+  tone(midi(55),t+0.20,0.18,'sawtooth',0.20);
+  tone(midi(51),t+0.40,0.22,'sawtooth',0.18);
+  tone(midi(46),t+0.64,0.36,'sawtooth',0.22);
+  noiseHit(t,0.9,0.08,400);
+}
+function sfxStairs(){ if(!AC)return; const t=AC.currentTime;
+  [60,64,67,72].forEach((n,i)=>tone(midi(n),t+i*0.06,0.07,'triangle',0.16));}
+
+/* ---------------- MAPAS ----------------
+ chars: '#'=rocha  '.'=chao  'T'=arvore  'R'=telhado  'W'=parede igreja
+ 'D'=porta  'A'=altar  'S'=escada(uso por stairs[])  'C'=muralha castelo
+ 'L'=porta trancada  'd'=chao escuro  'w'=parede interna ------------- */
+
+function G(rows){ return rows.map(r=>r.split('')); }
+
+const MAPS={};
+
+MAPS.campo1=G([
+"################",
+"#T............T#",
+"#.RRRRR........#",
+"#.RRRRR....T...#",
+"#.WWWWW........#",
+"#.WWDWW.........",
+"#...............",
+"#...............",
+"#......T.......#",
+"#T.........T...#",
+"#..............#",
+"#.....T........#",
+"################"]);
+
+MAPS.igreja=G([
+"wwwwwwwwwwwwwwww",
+"wwwwwwAAAAwwwwww",
+"w......AA......w",
+"w..............w",
+"w..............w",
+"w..h........h..w",
+"w..............w",
+"w..............w",
+"w..h........h..w",
+"w..............w",
+"w..............w",
+"w..............w",
+"wwwwwwwDDwwwwwww"]);
+
+MAPS.porao=G([
+"wwwwwwwwwwwwwwww",
+"w..............w",
+"w..............w",
+"w..............w",
+"w..............w",
+"w..............w",
+"w..............w",
+"w..............w",
+"w..............w",
+"w..............w",
+"w..............w",
+"w..............w",
+"wwwwwwwwwwwwwwww"]);
+
+MAPS.campo2=G([
+"######....######",
+"#T............T#",
+"#..............#",
+"#.....T........#",
+"#..T...........#",
+"................",
+"................",
+"................",
+"#........T.....#",
+"#..T...........#",
+"#............T.#",
+"#T.............#",
+"################"]);
+
+MAPS.campo2norte=G([
+"################",
+"#T...T.....T..T#",
+"#..............#",
+"#....T.........#",
+"#..............#",
+"#...............",
+"#...............",
+"#...............",
+"#..T.......T...#",
+"#..............#",
+"#......T.......#",
+"#T............T#",
+"######....######"]);
+
+MAPS.cruzamento=G([
+"######....######",
+"#T............T#",
+"#..............#",
+"#..T.......T...#",
+"#..............#",
+"................",
+"................",
+"................",
+"#..............#",
+"#...T.....T....#",
+"#..............#",
+"#T............T#",
+"######....######"]);
+
+MAPS.floresta=G([
+"################",
+"#T.T..T.T..T.TT#",
+"#.T.T...T.T..T.#",
+"#T...T.T...T...#",
+"#.T.T....T...TT#",
+"...T..T.T..T..T#",
+"..T....T....T.T#",
+".T..T.T..T.T..T#",
+"#.T...T...T..TT#",
+"#T.T.T..T.T..T.#",
+"#..T...T....T.T#",
+"#T..T.T..T.T..T#",
+"######....######"]);
+
+MAPS.campo3=G([
+"######....######",
+"#T............T#",
+"#..............#",
+"#....T....T....#",
+"#..............#",
+"#..............#",
+"#..T........T..#",
+"#..............#",
+"#..............#",
+"#....T....T....#",
+"#..............#",
+"#T............T#",
+"################"]);
+
+MAPS.campocastelo=G([
+"################",
+"#..CCCCCCCCCC..#",
+"#..CCCCCCCCCC..#",
+"#..CCCCCCCCCC..#",
+"#..CCCCLLCCCC..#",
+"...............#",
+"...............#",
+"...............#",
+"#......T.......#",
+"#..T.......T...#",
+"#..............#",
+"#T............T#",
+"################"]);
+
+MAPS.castelo1=G([
+"wwwwwwwwwwwwwwww",
+"w..............w",
+"w..............w",
+"w..w........w..w",
+"w..............w",
+"w..............w",
+"w..............w",
+"w..............w",
+"w..............w",
+"w..w........w..w",
+"w..............w",
+"w..............w",
+"wwwwwwwDDwwwwwww"]);
+
+MAPS.castelo2=G([
+"wwwwwwwwwwwwwwww",
+"w..............w",
+"w..............w",
+"w....w....w....w",
+"w..............w",
+"w..............w",
+"w..............w",
+"w..............w",
+"w..............w",
+"w....w....w....w",
+"w..............w",
+"w..............w",
+"wwwwwwwwwwwwwwww"]);
+MAPS.castelo3=MAPS.castelo2.map(r=>r.slice());
+MAPS.castelo4=MAPS.castelo2.map(r=>r.slice());
+
+MAPS.castelo5=G([
+"wwwwwwwwwwwwwwww",
+"w..............w",
+"w..............w",
+"w..............w",
+"w..............w",
+"w..............w",
+"w..............w",
+"w..............w",
+"w..............w",
+"w..............w",
+"w..............w",
+"w..............w",
+"wwwwwwwwwwwwwwww"]);
+
+/* ---------------- DEFINICAO DAS SALAS ---------------- */
+/* exits: {side:'E/W/N/S', from, to (tiles abrangidos), target, sx, sy} */
+function mkEnemy(type,tx,ty){ return {type, ox:tx*TILE+2, oy:ty*TILE+2}; }
+
+const ROOMS_DEF={
+  campo1:{ map:'campo1', music:'village', outdoor:true,
+    exits:[{side:'E',from:4,to:7,target:'campo2',sx:1,sy:6}],
+    npcs:[{type:'padre',x:9*TILE,y:6*TILE}],
+    doors:[{x:4,y:5,target:'igreja',sx:7.5,sy:10.5}],
+    enemies:[] },
+  igreja:{ map:'igreja', music:'village', indoor:true,
+    npcs:[{type:'rainha',x:7.5*TILE,y:3*TILE}],
+    doors:[{x:7,y:12,target:'campo1',sx:4,sy:6.2},{x:8,y:12,target:'campo1',sx:4,sy:6.2}],
+    stairs:[{x:13,y:10,target:'porao',sx:13,sy:9,dir:'down'}],
+    enemies:[] },
+  porao:{ map:'porao', music:'castle', dark:true, indoor:true,
+    stairs:[{x:2,y:10,target:'igreja',sx:11,sy:10,dir:'up'}],
+    blocks:[{x:5,y:7},{x:10,y:7}],
+    plates:[{x:5,y:4},{x:10,y:4}],
+    puzzleReward:'sword',
+    enemies:[] },
+  campo2:{ map:'campo2', music:'action', outdoor:true,
+    exits:[{side:'W',from:5,to:7,target:'campo1',sx:14,sy:6},
+           {side:'E',from:5,to:7,target:'cruzamento',sx:1,sy:6},
+           {side:'N',from:6,to:9,target:'campo2norte',sx:7.5,sy:11}],
+    enemies:[mkEnemy('goblin',4,3),mkEnemy('goblin',11,9),mkEnemy('bat',8,6)] },
+  campo2norte:{ map:'campo2norte', music:'action', outdoor:true,
+    exits:[{side:'S',from:6,to:9,target:'campo2',sx:7.5,sy:1},
+           {side:'E',from:5,to:7,target:'floresta',sx:1,sy:6}],
+    enemies:[mkEnemy('bat',4,3),mkEnemy('bat',11,8),mkEnemy('goblin',7,4),mkEnemy('goblin',9,9)] },
+  cruzamento:{ map:'cruzamento', music:'action', outdoor:true,
+    exits:[{side:'W',from:4,to:7,target:'campo2',sx:14,sy:6},
+           {side:'E',from:4,to:7,target:'campocastelo',sx:1,sy:6},
+           {side:'S',from:6,to:9,target:'campo3',sx:7.5,sy:1},
+           {side:'N',from:6,to:9,target:'floresta',sx:7.5,sy:11}],
+    enemies:[mkEnemy('bat',4,3),mkEnemy('bat',11,9),mkEnemy('goblin',6,4),mkEnemy('goblin',10,8)] },
+  floresta:{ map:'floresta', music:'action', outdoor:true, forest:true,
+    exits:[{side:'W',from:5,to:7,target:'campo2norte',sx:14,sy:6},
+           {side:'S',from:6,to:9,target:'cruzamento',sx:7.5,sy:1}],
+    bush:{x:12,y:3},
+    enemies:[mkEnemy('bat',3,3),mkEnemy('bat',12,9),mkEnemy('wizard',6,3),mkEnemy('wizard',10,9),mkEnemy('goblin',5,8),mkEnemy('goblin',11,5)] },
+  campo3:{ map:'campo3', music:'action', outdoor:true,
+    exits:[{side:'N',from:6,to:9,target:'cruzamento',sx:7.5,sy:11}],
+    clearReward:'bluesword',
+    enemies:[mkEnemy('bat',3,3),mkEnemy('bat',12,3),mkEnemy('bat',3,9),mkEnemy('bat',12,9),
+             mkEnemy('goblin',5,5),mkEnemy('goblin',10,5),mkEnemy('goblin',5,8),mkEnemy('goblin',10,8),
+             mkEnemy('wizard',7,3),mkEnemy('wizard',8,10)] },
+  campocastelo:{ map:'campocastelo', music:'action', outdoor:true,
+    exits:[{side:'W',from:5,to:7,target:'cruzamento',sx:14,sy:6}],
+    lockedDoor:{x1:7,x2:8,y:4,target:'castelo1',sx:7.5,sy:10.5},
+    enemies:[mkEnemy('wizard',3,9),mkEnemy('goblin',11,8),mkEnemy('bat',8,7)] },
+  castelo1:{ map:'castelo1', music:'castle', indoor:true, castle:true,
+    doors:[{x:7,y:12,target:'campocastelo',sx:7.5,sy:5.2},{x:8,y:12,target:'campocastelo',sx:7.5,sy:5.2}],
+    blocks:[{x:6,y:6},{x:9,y:6},{x:7,y:5},{x:8,y:7}],
+    plates:[{x:4,y:6},{x:11,y:6},{x:7,y:3},{x:8,y:9}],
+    puzzleReward:'stairs', secretStair:{x:13,y:1,target:'castelo2',sx:13,sy:4,dir:'up'},
+    enemies:[] },
+  castelo2:{ map:'castelo2', music:'castle', indoor:true, castle:true,
+    stairs:[{x:14,y:6,target:'castelo1',sx:11,sy:2,dir:'down'}],
+    clearStair:{x:1,y:6,target:'castelo3',sx:2,sy:4,dir:'up'},
+    enemies:[mkEnemy('goblin',5,2),mkEnemy('goblin',10,2),mkEnemy('goblin',5,10),mkEnemy('goblin',10,10)] },
+  castelo3:{ map:'castelo3', music:'castle', indoor:true, castle:true,
+    stairs:[{x:1,y:6,target:'castelo2',sx:2,sy:8,dir:'down'}],
+    clearStair:{x:14,y:6,target:'castelo4',sx:13,sy:4,dir:'up'},
+    enemies:[mkEnemy('wizard',5,3),mkEnemy('wizard',10,3),mkEnemy('wizard',5,9),mkEnemy('wizard',10,9)] },
+  castelo4:{ map:'castelo4', music:'castle', indoor:true, castle:true,
+    stairs:[{x:14,y:6,target:'castelo3',sx:13,sy:8,dir:'down'}],
+    clearStair:{x:1,y:6,target:'castelo5',sx:2,sy:10,dir:'up'},
+    enemies:[mkEnemy('wizard',5,2),mkEnemy('wizard',10,10),mkEnemy('bat',10,2),mkEnemy('bat',5,10),mkEnemy('goblin',7,6),mkEnemy('goblin',8,6)] },
+  castelo5:{ map:'castelo5', music:'boss', indoor:true, castle:true, boss:true,
+    stairs:[{x:14,y:1,target:'castelo4',sx:2,sy:4,dir:'down'}],
+    enemies:[mkEnemy('vampire',7,4)] }
+};
+
+/* ---------------- ESTADO ---------------- */
+let state='title';   // title | play | dialog | dying | gameover | ending
+let titleBlink=0;
+let dyingTimer=0;    // tempo restante no estado 'dying' antes do game over
+const flags={
+  hasSword:false, hasBlueSword:false, hasKey:false, hasCross:false,
+  crossDelivered:false, bossDefeated:false, castleUnlocked:false,
+  padreCourageSaid:false, padreBlueSaid:false, gameEnded:false
+};
+const player={ x:7.5*TILE, y:8*TILE, w:12, h:12, dir:'down', hp:3, maxhp:3,
+  invuln:0, attackT:0, walkAnim:0, kbx:0, kby:0, kbT:0 };
+
+const roomState={};  // estado persistente por sala
+let cur=null, curName='';
+let stairLockT=0;
+let gameOverSel=0;   // 0 = SIM, 1 = NAO
+let gameOverPhase=0; // 0 = mensagem inicial, 1 = seleção
+let goNavLock=false;
+let projectiles=[], particles=[], floats=[];
+let dialog=null;
+
+function initRoomState(name){
+  if(roomState[name]) return roomState[name];
+  const def=ROOMS_DEF[name];
+  const rs={
+    enemies: def.enemies.map(e=>({...e, x:e.ox, y:e.oy, hp:hpFor(e.type), dead:false, deadAt:0,
+      t:Math.random()*2, phase:'idle', ang:Math.random()*6.28, fireT:0, batT:0, visT:0, flinch:0 })),
+    blocks: def.blocks?def.blocks.map(b=>({x:b.x,y:b.y})):[],
+    puzzleSolved:false, rewardTaken:false, clearDone:false,
+    bushCut:false, keyTaken:false, items:[], stairRevealed:false
+  };
+  roomState[name]=rs;
+  return rs;
+}
+function hpFor(t){ return t==='bat'?2 : t==='goblin'?2 : t==='wizard'?1 : t==='vampire'?9 : 1; }
+
+function enterRoom(name, sx, sy){
+  curName=name;
+  cur=ROOMS_DEF[name];
+  initRoomState(name);
+  player.x=sx*TILE; player.y=sy*TILE;
+  player.invuln=1.0; player.attackT=0; player.kbT=0;
+  stairLockT=0.4;
+  projectiles=[]; particles=[];
+  // respawn check
+  const rs=roomState[name];
+  const now=performance.now();
+  for(const e of rs.enemies){
+    if(e.dead && !flags.bossDefeated && e.type!=='vampire' && now-e.deadAt>RESPAWN_MS){
+      e.dead=false; e.hp=hpFor(e.type); e.x=e.ox; e.y=e.oy; e.phase='idle'; e.t=0;
+      // nao reaparecer em cima do heroi
+      if(Math.hypot(e.x-player.x,e.y-player.y)<50){ e.x=(e.x+80)%(COLS*TILE-32)+16; }
+    }
+    if(flags.bossDefeated) e.dead=true;
+  }
+  if(flags.hasCross || flags.crossDelivered) setMusic(null);
+  else setMusic(cur.music);
+}
+
+/* ---------------- COLISAO ---------------- */
+function tileAt(tx,ty){
+  if(tx<0||ty<0||tx>=COLS||ty>=ROWS) return '#';
+  return MAPS[cur.map][ty][tx];
+}
+function solidChar(c){
+  if(c==='#'||c==='w'||c==='W'||c==='R'||c==='A'||c==='C'||c==='h') return true;
+  if(c==='T') return !cur.forest;       // arvores na floresta nao colidem
+  if(c==='L') return true;
+  return false;
+}
+function rectSolid(x,y,w,h,rs){
+  const x1=Math.floor(x/TILE), y1=Math.floor(y/TILE),
+        x2=Math.floor((x+w-1)/TILE), y2=Math.floor((y+h-1)/TILE);
+  for(let ty=y1;ty<=y2;ty++) for(let tx=x1;tx<=x2;tx++){
+    if(solidChar(tileAt(tx,ty))) return true;
+  }
+  // blocos
+  if(rs) for(const b of rs.blocks){
+    if(x < b.x*TILE+TILE && x+w > b.x*TILE && y < b.y*TILE+TILE && y+h > b.y*TILE) return true;
+  }
+  // npcs solidos
+  if(cur.npcs) for(const n of cur.npcs){
+    if(x < n.x+14 && x+w > n.x+2 && y < n.y+15 && y+h > n.y+4) return true;
+  }
+  // arbusto solido enquanto nao cortado
+  if(cur.bush && rs && !rs.bushCut){
+    const b=cur.bush;
+    if(x < b.x*TILE+TILE && x+w > b.x*TILE && y < b.y*TILE+TILE && y+h > b.y*TILE) return true;
+  }
+  return false;
+}
+function moveEntity(e,dx,dy,rs){
+  if(dx!==0){ if(!rectSolid(e.x+dx,e.y,e.w||12,e.h||12,rs)) e.x+=dx; }
+  if(dy!==0){ if(!rectSolid(e.x,e.y+dy,e.w||12,e.h||12,rs)) e.y+=dy; }
+  if(e===player){
+    e.x=Math.max(-6,Math.min(COLS*TILE-6,e.x));
+    e.y=Math.max(-6,Math.min(ROWS*TILE-6,e.y));
+  }
+}
+function overlap(a,b,aw,ah,bw,bh){
+  return a.x < b.x+bw && a.x+aw > b.x && a.y < b.y+bh && a.y+ah > b.y;
+}
+
+/* ---------------- DIALOGO ---------------- */
+function say(lines, onDone){
+  dialog={pages:Array.isArray(lines)?lines:[lines], idx:0, char:0, onDone:onDone||null};
+  state='dialog';
+}
+function wrapText(t,max){
+  const words=t.split(' '), out=[]; let line='';
+  for(const w of words){
+    if((line+' '+w).trim().length>max){ out.push(line.trim()); line=w; }
+    else line+=' '+w;
+  }
+  if(line.trim()) out.push(line.trim());
+  return out;
+}
+
+/* ---------------- LOGICA NPCs ---------------- */
+function talkPadre(){
+  if(flags.hasCross && !flags.crossDelivered){
+    flags.crossDelivered=true; flags.hasCross=false;
+    setMusic(null);
+    say(["PARABENS, MEU JOVEM! VOCE E CORAJOSO!",
+          "VOCE E REALMENTE O REI!",
+          "OBRIGADO POR TRAZER A CRUZ SAGRADA DE VOLTA.",
+         "AGORA SEU REINO ESTARA EM PAZ! PROCURE SUA RAINHA."]);
+    return;
+  }
+  if(flags.crossDelivered){
+    say("PROCURE SUA RAINHA."); return;
+  }
+  if(flags.hasBlueSword && !flags.padreBlueSaid){
+    flags.padreBlueSaid=true;
+    say("ESSA ESPADA E MUITO PODEROSA."); return;
+  }
+  if(flags.hasKey){
+    say("DERROTE O VAMPIRAO!"); return;
+  }
+  if(flags.hasSword && !flags.padreCourageSaid){
+    flags.padreCourageSaid=true;
+    say(["DIZEM QUE HA UMA CHAVE ESCONDIDA NA FLORESTA."]); return;
+  }
+  if(flags.hasSword){
+    say("VOCE E CORAJOSO. DERROTE O VAMPIRAO!"); return;
+  }
+  say(["A CRUZ SAGRADA FOI ROUBADA PELO PERIGOSO VAMPIRAO.",
+       "PRECISAMOS DE UM JOVEM CORAJOSO PARA NOS AJUDAR.",
+       "DIZEM QUE HA UMA ESPADA ESCONDIDA NA IGREJA."]);
+}
+function talkRainha(){
+  if(flags.crossDelivered){
+    say("AGORA PODEREMOS VIVER FELIZES EM NOSSO REINO COM NOSSA FAMILIA!",
+      ()=>{ flags.gameEnded=true; sfxFanfare(); state='ending'; });
+    return;
+  }
+  if(flags.hasCross){ say("FALE COM O PADRE."); return; }
+  say("QUERIDO, PRECISAMOS RECUPERAR A CRUZ SAGRADA E PROTEGER NOSSO REINO.");
+}
+
+/* ---------------- ATUALIZACAO ---------------- */
+let lastT=performance.now();
+
+function update(dt){
+  const inp=readInput();
+  const rs=roomState[curName];
+  const now=performance.now();
+  if(stairLockT>0) stairLockT-=dt;
+
+  /* respawn em tempo real */
+  if(!flags.bossDefeated) for(const e of rs.enemies){
+    if(e.dead && e.type!=='vampire' && now-e.deadAt>RESPAWN_MS){
+      if(Math.hypot(e.ox-player.x,e.oy-player.y)>60){
+        e.dead=false; e.hp=hpFor(e.type); e.x=e.ox; e.y=e.oy; e.phase='idle'; e.t=0;
+      }
+    }
+  }
+
+  /* ---- jogador ---- */
+  if(player.kbT>0){
+    player.kbT-=dt;
+    moveEntity(player, player.kbx*dt, player.kby*dt, rs);
+  } else if(player.attackT<=0){
+    let dx=0,dy=0;
+    if(inp.lf){dx=-1;player.dir='left';}
+    else if(inp.rt){dx=1;player.dir='right';}
+    if(inp.up){dy=-1;player.dir='up';}
+    else if(inp.dn){dy=1;player.dir='down';}
+    if(dx&&dy){dx*=0.707;dy*=0.707;}
+    if(dx||dy){
+      player.walkAnim+=dt*8;
+      // empurrar blocos
+      tryPushBlock(dx,dy,rs,dt);
+      moveEntity(player, dx*HERO_SPEED*dt, dy*HERO_SPEED*dt, rs);
+    }
+  }
+  if(player.invuln>0) player.invuln-=dt;
+  if(player.attackT>0) player.attackT-=dt;
+
+  /* acao */
+  if(actionPressed){
+    // falar com NPC?
+    const npc=npcInFront();
+    if(npc){
+      if(npc.type==='padre') talkPadre(); else talkRainha();
+    } else if(flags.hasSword || flags.hasBlueSword){
+      player.attackT=0.22; sfxSwing();
+      doSwordHits(rs);
+    }
+  }
+  if(player.attackT>0.1) doSwordHits(rs); // janela do golpe
+
+  /* itens da sala */
+  for(let i=rs.items.length-1;i>=0;i--){
+    const it=rs.items[i];
+    if(overlap(player,it,12,12,14,14)){
+      if(it.kind==='heart'){ if(player.hp<player.maxhp){player.hp++; sfxHeart(); rs.items.splice(i,1);} }
+      else if(it.kind==='sword'){ flags.hasSword=true; sfxFanfare(); rs.items.splice(i,1);
+        say("VOCE ENCONTROU A ESPADA!"); }
+      else if(it.kind==='bluesword'){ flags.hasBlueSword=true; sfxFanfare(); rs.items.splice(i,1);
+        say("VOCE ENCONTROU A ESPADA AZUL! ELA E MUITO PODEROSA!"); }
+      else if(it.kind==='key'){ flags.hasKey=true; sfxPickup(); rs.items.splice(i,1);
+        say("VOCE ENCONTROU A CHAVE DO CASTELO!"); }
+      else if(it.kind==='cross'){ flags.hasCross=true; sfxFanfare(); setMusic(null); rs.items.splice(i,1);
+        say("VOCE RECUPEROU A CRUZ SAGRADA! LEVE-A AO PADRE."); }
+    }
+  }
+
+  /* portas */
+  if(cur.doors) for(const d of cur.doors){
+    if(overlap(player,{x:d.x*TILE,y:d.y*TILE},12,12,TILE,TILE)){
+      enterRoom(d.target,d.sx,d.sy); return;
+    }
+  }
+  /* porta trancada do castelo */
+  if(cur.lockedDoor){
+    const L=cur.lockedDoor;
+    const dr={x:L.x1*TILE,y:L.y*TILE};
+    if(player.y < (L.y+1)*TILE+2 && player.y+12 > L.y*TILE &&
+       player.x+12 > L.x1*TILE && player.x < (L.x2+1)*TILE){
+      if(flags.castleUnlocked){
+        enterRoom(L.target,L.sx,L.sy); return;
+      } else if(flags.hasKey){
+        flags.castleUnlocked=true; sfxUnlock();
+        say("VOCE ABRIU A PORTA DO CASTELO!");
+      } else {
+        player.y=(L.y+1)*TILE+2;
+        if(actionPressed===false && player.invuln<=0){} 
+        if(!cur._saidLocked || now-cur._saidLocked>1500){
+          cur._saidLocked=now;
+          say("ESTA TRANCADO. E PRECISO UMA CHAVE.");
+        }
+      }
+    }
+  }
+  /* escadas */
+  if(stairLockT<=0){
+    const allStairs=[];
+    if(cur.stairs) allStairs.push(...cur.stairs);
+    if(cur.secretStair && rs.stairRevealed) allStairs.push(cur.secretStair);
+    if(cur.clearStair && rs.stairRevealed) allStairs.push(cur.clearStair);
+    for(const s of allStairs){
+      if(overlap(player,{x:s.x*TILE,y:s.y*TILE},12,12,TILE,TILE)){
+        sfxStairs(); enterRoom(s.target,s.sx,s.sy); return;
+      }
+    }
+  }
+  /* saidas pelas bordas */
+  if(cur.exits) for(const ex of cur.exits){
+    const ty=Math.floor((player.y+6)/TILE), tx=Math.floor((player.x+6)/TILE);
+    if(ex.side==='E' && player.x>COLS*TILE-14 && ty>=ex.from && ty<=ex.to){ enterRoom(ex.target,ex.sx,ex.sy); return; }
+    if(ex.side==='W' && player.x<2 && ty>=ex.from && ty<=ex.to){ enterRoom(ex.target,ex.sx,ex.sy); return; }
+    if(ex.side==='S' && player.y>ROWS*TILE-14 && tx>=ex.from && tx<=ex.to){ enterRoom(ex.target,ex.sx,ex.sy); return; }
+    if(ex.side==='N' && player.y<2 && tx>=ex.from && tx<=ex.to){ enterRoom(ex.target,ex.sx,ex.sy); return; }
+  }
+
+  /* enigma das placas */
+  if(cur.plates && !rs.puzzleSolved){
+    let all=true;
+    for(const p of cur.plates){
+      if(!rs.blocks.some(b=>b.x===p.x&&b.y===p.y)) all=false;
+    }
+    if(all){
+      rs.puzzleSolved=true; sfxMystery();
+      if(cur.puzzleReward==='sword' && !rs.rewardTaken){
+        rs.items.push({kind: flags.hasSword?'heart':'sword', x:7.5*TILE, y:3*TILE});
+        rs.rewardTaken=true;
+      } else if(cur.puzzleReward==='stairs'){
+        rs.stairRevealed=true;
+      }
+    }
+  }
+  /* recompensa por limpar a sala */
+  const alive=rs.enemies.filter(e=>!e.dead).length;
+  if(alive===0 && !rs.clearDone){
+    if(cur.clearReward==='bluesword' && !flags.hasBlueSword){
+      rs.clearDone=true; sfxMystery();
+      rs.items.push({kind:'bluesword', x:7.5*TILE, y:6*TILE});
+    } else if(cur.clearStair){
+      rs.clearDone=true; sfxMystery(); rs.stairRevealed=true;
+    }
+  }
+
+  /* ---- inimigos ---- */
+  for(const e of rs.enemies){
+    if(e.dead) continue;
+    updateEnemy(e,dt,rs);
+    if(e.flinch>0) e.flinch-=dt;
+    /* contato com jogador */
+    const ew=e.type==='vampire'?22:12, eh=e.type==='vampire'?22:12;
+    if(e.type!=='wizard' || e.phase!=='hidden'){
+      if(player.invuln<=0 && overlap(player,e,12,12,ew,eh)){
+        hurtPlayer(e.x+ew/2, e.y+eh/2);
+      }
+    }
+  }
+  separateEnemies(rs);
+
+  /* projeteis */
+  for(let i=projectiles.length-1;i>=0;i--){
+    const pj=projectiles[i];
+    pj.x+=pj.vx*dt; pj.y+=pj.vy*dt; pj.t+=dt;
+    if(pj.x<-8||pj.y<-8||pj.x>COLS*TILE+8||pj.y>ROWS*TILE+8 ||
+       solidChar(tileAt(Math.floor((pj.x+3)/TILE),Math.floor((pj.y+3)/TILE)))){
+      projectiles.splice(i,1); continue;
+    }
+    if(player.invuln<=0 && overlap(player,pj,12,12,6,6)){
+      projectiles.splice(i,1); hurtPlayer(pj.x,pj.y);
+    }
+  }
+  /* particulas */
+  for(let i=particles.length-1;i>=0;i--){
+    const p=particles[i]; p.t-=dt; p.x+=p.vx*dt; p.y+=p.vy*dt;
+    if(p.t<=0) particles.splice(i,1);
+  }
+  for(let i=floats.length-1;i>=0;i--){ floats[i].t-=dt; floats[i].y-=14*dt; if(floats[i].t<=0) floats.splice(i,1); }
+}
+
+function npcInFront(){
+  if(!cur.npcs) return null;
+  let fx=player.x, fy=player.y;
+  if(player.dir==='up') fy-=12; if(player.dir==='down') fy+=12;
+  if(player.dir==='left') fx-=12; if(player.dir==='right') fx+=12;
+  for(const n of cur.npcs){
+    if(fx < n.x+16 && fx+12 > n.x && fy < n.y+16 && fy+12 > n.y) return n;
+  }
+  return null;
+}
+
+function tryPushBlock(dx,dy,rs,dt){
+  if(!rs.blocks.length) return;
+  const sx=Math.sign(dx), sy=Math.sign(dy);
+  if(sx&&sy) return;
+  const probeX=player.x+sx*3, probeY=player.y+sy*3;
+  for(const b of rs.blocks){
+    if(probeX < b.x*TILE+TILE && probeX+12 > b.x*TILE &&
+       probeY < b.y*TILE+TILE && probeY+12 > b.y*TILE){
+      b.pushT=(b.pushT||0)+dt;
+      if(b.pushT>0.18){
+        b.pushT=0;
+        const nx=b.x+sx, ny=b.y+sy;
+        if(!solidChar(tileAt(nx,ny)) && !rs.blocks.some(o=>o!==b&&o.x===nx&&o.y===ny)){
+          b.x=nx; b.y=ny; sfxPush();
+        }
+      }
+      return;
+    }
+  }
+}
+
+function doSwordHits(rs){
+  const dmg=flags.hasBlueSword?2:1;
+  let hx=player.x, hy=player.y, hw=14, hh=14;
+  if(player.dir==='up'){hy-=13;}
+  if(player.dir==='down'){hy+=13;}
+  if(player.dir==='left'){hx-=13;}
+  if(player.dir==='right'){hx+=13;}
+  /* arbusto */
+  if(cur.bush && !rs.bushCut){
+    const b=cur.bush;
+    if(hx < b.x*TILE+TILE && hx+hw > b.x*TILE && hy < b.y*TILE+TILE && hy+hh > b.y*TILE){
+      rs.bushCut=true; sfxMystery();
+      if(!flags.hasKey && !rs.keyTaken){
+        rs.items.push({kind:'key', x:b.x*TILE+1, y:b.y*TILE+1}); rs.keyTaken=true;
+      }
+      spawnLeaves(b.x*TILE+8,b.y*TILE+8);
+    }
+  }
+  for(const e of rs.enemies){
+    if(e.dead || e.flinch>0) continue;
+    if(e.type==='wizard' && e.phase==='hidden') continue;
+    const ew=e.type==='vampire'?22:12, eh=e.type==='vampire'?22:12;
+    if(hx < e.x+ew && hx+hw > e.x && hy < e.y+eh && hy+hh > e.y){
+      e.hp-=dmg; e.flinch=0.35;
+      const kb=18;
+      const ang=Math.atan2(e.y-player.y,e.x-player.x);
+      e.x+=Math.cos(ang)*kb*0.4; e.y+=Math.sin(ang)*kb*0.4;
+      if(e.hp<=0) killEnemy(e,rs); else sfxEnemyHit();
+    }
+  }
+}
+
+function killEnemy(e,rs){
+  e.dead=true; e.deadAt=performance.now();
+  if(e.type==='vampire'){
+    sfxExplosion(); flags.bossDefeated=true;
+    for(const rn in roomState) for(const en of roomState[rn].enemies) en.dead=true;
+    spawnExplosion(e.x+11,e.y+11);
+    rs.items.push({kind:'cross', x:7.5*TILE, y:6*TILE});
+    setMusic(null);
+    return;
+  }
+  sfxEnemyDie();
+  spawnPoof(e.x+6,e.y+6);
+  if(Math.random()<0.33){
+    rs.items.push({kind:'heart', x:e.x, y:e.y});
+  }
+}
+
+function hurtPlayer(fx,fy){
+  player.hp--; player.invuln=1.3; sfxHurt();
+  const ang=Math.atan2(player.y+6-fy, player.x+6-fx);
+  player.kbx=Math.cos(ang)*140; player.kby=Math.sin(ang)*140; player.kbT=0.15;
+  if(player.hp<=0){
+    state='dying'; dyingTimer=1.05; setMusic(null); sfxFail();
+  }
+}
+
+function spawnPoof(x,y){
+  for(let i=0;i<8;i++){
+    const a=i/8*6.28;
+    particles.push({x,y,vx:Math.cos(a)*40,vy:Math.sin(a)*40,t:0.3,c:P.white,s:3});
+  }
+}
+function spawnLeaves(x,y){
+  for(let i=0;i<10;i++){
+    particles.push({x,y,vx:(Math.random()-0.5)*70,vy:(Math.random()-0.5)*70,t:0.4,c:P.red,s:3});
+  }
+}
+function spawnExplosion(x,y){
+  for(let i=0;i<26;i++){
+    const a=Math.random()*6.28, sp=30+Math.random()*90;
+    particles.push({x,y,vx:Math.cos(a)*sp,vy:Math.sin(a)*sp,t:0.5+Math.random()*0.5,
+      c:[P.orange,P.yellow,P.red,P.white][i%4],s:4});
+  }
+}
+
+/* ---------------- SEPARACAO ENTRE INIMIGOS ---------------- */
+function enemyRadius(e){ return e.type==='vampire'?11:6; }
+function separateEnemies(rs){
+  const list=rs.enemies.filter(e=>!e.dead && !(e.type==='wizard'&&e.phase==='hidden'));
+  for(let i=0;i<list.length;i++){
+    for(let j=i+1;j<list.length;j++){
+      const a=list[i], b=list[j];
+      const ar=enemyRadius(a), br=enemyRadius(b);
+      const acx=a.x+ar, acy=a.y+ar, bcx=b.x+br, bcy=b.y+br;
+      let dx=bcx-acx, dy=bcy-acy;
+      let dist=Math.hypot(dx,dy);
+      const minD=ar+br;
+      if(dist<minD){
+        if(dist<0.01){ dx=(Math.random()-0.5); dy=(Math.random()-0.5); dist=Math.hypot(dx,dy)||1; }
+        const overlap=(minD-dist)/2;
+        const ux=dx/dist, uy=dy/dist;
+        // morcego e vampiro voam (sem checar parede); demais respeitam colisao
+        nudge(a,-ux*overlap,-uy*overlap,rs);
+        nudge(b, ux*overlap, uy*overlap,rs);
+      }
+    }
+  }
+}
+function nudge(e,dx,dy,rs){
+  if(e.type==='bat'||e.type==='vampire'){
+    e.x=Math.max(4,Math.min(COLS*TILE-16,e.x+dx));
+    e.y=Math.max(4,Math.min(ROWS*TILE-16,e.y+dy));
+  } else {
+    moveEntity(e,dx,0,rs); moveEntity(e,0,dy,rs);
+  }
+}
+
+/* ---------------- IA DOS INIMIGOS ---------------- */
+function updateEnemy(e,dt,rs){
+  e.t+=dt;
+  if(e.type==='bat'){
+    if(e.phase==='idle'||e.phase==='pause'){
+      if(e.phase==='idle'){ e.phase='move'; e.t=0;
+        e.ang=Math.atan2(player.y-e.y,player.x-e.x)+(Math.random()-0.5);
+        e.turn=(Math.random()<0.5?-1:1)*2.4;
+      } else if(e.t>2){ e.phase='move'; e.t=0;
+        e.ang=Math.atan2(player.y-e.y,player.x-e.x)+(Math.random()-0.5);
+        e.turn=(Math.random()<0.5?-1:1)*2.4;
+      }
+    }
+    if(e.phase==='move'){
+      e.ang+=e.turn*dt;
+      const dx=Math.cos(e.ang)*BAT_SPEED*dt, dy=Math.sin(e.ang)*BAT_SPEED*dt;
+      // morcego voa por cima de tudo, mas fica na sala
+      e.x=Math.max(4,Math.min(COLS*TILE-16,e.x+dx));
+      e.y=Math.max(4,Math.min(ROWS*TILE-16,e.y+dy));
+      if(e.t>1.2){ e.phase='pause'; e.t=0; }
+    }
+  }
+  else if(e.type==='goblin'){
+    const dx=player.x-e.x, dy=player.y-e.y;
+    let mx=0,my=0;
+    if(Math.abs(dx)>Math.abs(dy)) mx=Math.sign(dx); else my=Math.sign(dy);
+    if(Math.floor(e.t*2)%2===0){ const tmp=mx; if(Math.abs(dx)>2&&Math.abs(dy)>2){ mx=my?0:mx; } }
+    moveEntity(e, mx*GOB_SPEED*dt, my*GOB_SPEED*dt, rs);
+  }
+  else if(e.type==='wizard'){
+    if(!e.phase || e.phase==='idle'){ e.phase='visible'; e.visT=0; e.shot=false; }
+    e.visT+=dt;
+    if(e.phase==='visible'){
+      if(!e.shot && e.visT>1.6){
+        e.shot=true; sfxFire();
+        const ang=Math.atan2(player.y+6-(e.y+6), player.x+6-(e.x+6));
+        projectiles.push({x:e.x+5,y:e.y+5,vx:Math.cos(ang)*FIRE_SPEED,vy:Math.sin(ang)*FIRE_SPEED,t:0,kind:'magic'});
+      }
+      if(e.visT>4){ e.phase='hidden'; e.visT=0; }
+    } else if(e.phase==='hidden'){
+      if(e.visT>2){
+        e.phase='visible'; e.visT=0; e.shot=false;
+        // teleporta longe do heroi
+        for(let tries=0;tries<24;tries++){
+          const tx=1+Math.floor(Math.random()*(COLS-2)), ty=1+Math.floor(Math.random()*(ROWS-2));
+          if(!solidChar(tileAt(tx,ty)) && Math.hypot(tx*TILE-player.x,ty*TILE-player.y)>96){
+            e.x=tx*TILE+2; e.y=ty*TILE+2; break;
+          }
+        }
+      }
+    }
+  }
+  else if(e.type==='vampire'){
+    e.w=22;e.h=22;
+    const dx=player.x-e.x-5, dy=player.y-e.y-5;
+    const d=Math.hypot(dx,dy)||1;
+    const wob=Math.sin(e.t*3)*16;
+    moveEntity(e,(dx/d)*VAMP_SPEED*dt + Math.cos(e.t*2)*wob*dt, (dy/d)*VAMP_SPEED*dt, rs);
+    e.fireT+=dt; e.batT+=dt;
+    if(e.fireT>3.0){
+      e.fireT=0; sfxFire();
+      const ang=Math.atan2(player.y+6-(e.y+11), player.x+6-(e.x+11));
+      projectiles.push({x:e.x+9,y:e.y+9,vx:Math.cos(ang)*100,vy:Math.sin(ang)*100,t:0,kind:'fire'});
+    }
+    if(e.batT>20){
+      e.batT=0;
+      const nb={type:'bat',ox:e.x,oy:e.y,x:e.x,y:e.y,hp:2,dead:false,deadAt:0,t:0,phase:'idle',ang:0,flinch:0,spawned:true};
+      rs.enemies.push(nb);
+    }
+  }
+}
+
+/* ---------------- DESENHO ---------------- */
+function px(x,y,w,h,c){ ctx.fillStyle=c; ctx.fillRect(Math.round(x),Math.round(y),w,h); }
+
+function drawTile(c,tx,ty){
+  const x=tx*TILE, y=ty*TILE+PLAY_Y;
+  const indoor=cur.indoor, castle=cur.castle, dark=cur.dark;
+  if(c==='.'){
+    if(dark){ px(x,y,16,16,'#181018'); px(x+7,y+7,2,2,'#241a24'); }
+    else if(castle){ px(x,y,16,16,'#2c2c34'); px(x,y,16,1,'#383844'); px(x+8,y+8,1,1,'#383844'); }
+    else if(indoor){ px(x,y,16,16,P.tan); px(x,y,16,1,P.brown); px(x,y+8,16,1,P.brown); }
+    else { px(x,y,16,16,P.grass); if((tx+ty)%2===0){px(x+3,y+4,2,2,P.grass2);px(x+10,y+11,2,2,P.grass2);} }
+  }
+  else if(c==='#'){ // rocha
+    px(x,y,16,16,P.gray); px(x,y,16,2,P.lgray); px(x+1,y+2,3,3,P.lgray);
+    px(x,y+13,16,3,P.dgray); px(x+9,y+8,4,4,P.dgray);
+  }
+  else if(c==='T'){ // arvore
+    if(cur.forest||!indoor){ px(x,y,16,16,P.grass); }
+    px(x+2,y+1,12,9,P.dgreen); px(x+4,y-1,8,4,P.dgreen);
+    px(x+3,y+2,4,3,P.green); px(x+9,y+4,3,3,P.green);
+    px(x+6,y+10,4,6,P.dbrown); px(x+6,y+10,2,6,P.brown);
+  }
+  else if(c==='R'){ px(x,y,16,16,P.dred); px(x,y,16,3,P.red); px(x+4,y+6,2,2,P.red); px(x+10,y+10,2,2,P.red); }
+  else if(c==='W'){ px(x,y,16,16,P.cream); px(x,y,16,2,P.lgray); px(x,y+14,16,2,P.tan);
+    px(x+2,y+4,3,5,P.dbrown); }
+  else if(c==='D'){ // porta
+    if(indoor){ px(x,y,16,16,castle?'#2c2c34':P.tan); px(x+2,y,12,16,P.dbrown); px(x+4,y+2,8,14,P.brown); }
+    else { px(x,y,16,16,P.cream); px(x+2,y+2,12,14,P.dbrown); px(x+4,y+4,8,12,P.brown); px(x+11,y+9,2,2,P.yellow); }
+  }
+  else if(c==='A'){ // altar
+    px(x,y,16,16,P.lgray); px(x,y,16,3,P.white); px(x,y+13,16,3,P.gray);
+  }
+  else if(c==='w'){ // parede interna
+    const base=castle?'#1a1a22':(dark?'#100a10':P.dbrown);
+    const hi=castle?'#34343e':(dark?'#241624':P.brown);
+    px(x,y,16,16,base); px(x,y,16,2,hi); px(x+1,y+4,6,3,hi); px(x+9,y+9,6,3,hi);
+  }
+  else if(c==='h'){ // banco de igreja
+    // Chão sob o banco
+    px(x,y,16,16,P.tan);
+    // Pés do banco (2 pés na frente)
+    px(x+2, y+12, 2, 4, P.dbrown);
+    px(x+12,y+12, 2, 4, P.dbrown);
+    // Assento
+    px(x+1, y+8,  14, 3, P.brown);
+    px(x+1, y+8,  14, 1, P.tan);   // brilho no topo
+    // Encosto (parte traseira, mais alto)
+    px(x+1, y+3,  14, 5, P.dbrown);
+    px(x+1, y+3,  14, 1, P.brown); // brilho no topo do encosto
+    px(x+2, y+4,  3,  3, P.brown); // decoração esquerda
+    px(x+11,y+4,  3,  3, P.brown); // decoração direita
+  }
+  else if(c==='C'){ // muralha do castelo
+    px(x,y,16,16,'#50505c'); px(x,y,16,2,'#6c6c7c'); px(x+1,y+4,6,4,'#3a3a44');
+    px(x+9,y+10,6,4,'#3a3a44'); px(x,y+14,16,2,'#2c2c34');
+  }
+  else if(c==='L'){ // porta trancada
+    px(x,y,16,16,'#50505c'); px(x+1,y+1,14,15,P.dbrown); px(x+3,y+3,10,13,P.brown);
+    if(!flags.castleUnlocked){ px(x+6,y+7,4,5,P.yellow); px(x+7,y+9,2,2,P.black); }
+    else { px(x+3,y+3,10,13,P.black); }
+  }
+}
+
+function drawRoom(){
+  const m=MAPS[cur.map];
+  for(let ty=0;ty<ROWS;ty++) for(let tx=0;tx<COLS;tx++) drawTile(m[ty][tx],tx,ty);
+  const rs=roomState[curName];
+
+  /* placas */
+  if(cur.plates) for(const p of cur.plates){
+    const x=p.x*TILE, y=p.y*TILE+PLAY_Y;
+    px(x+3,y+3,10,10,rs.puzzleSolved?P.yellow:P.dgray);
+    px(x+5,y+5,6,6,cur.dark?'#181018':(cur.castle?'#2c2c34':P.tan));
+  }
+  /* blocos */
+  for(const b of rs.blocks){
+    const x=b.x*TILE, y=b.y*TILE+PLAY_Y;
+    px(x,y,16,16,P.gray); px(x+1,y+1,14,3,P.lgray); px(x+1,y+12,14,3,P.dgray);
+    px(x+4,y+5,8,6,P.dgray); px(x+5,y+6,6,4,P.gray);
+  }
+  /* escadas */
+  const allStairs=[];
+  if(cur.stairs) allStairs.push(...cur.stairs.map(s=>({...s,vis:true})));
+  if(cur.secretStair) allStairs.push({...cur.secretStair,vis:rs.stairRevealed});
+  if(cur.clearStair) allStairs.push({...cur.clearStair,vis:rs.stairRevealed});
+  for(const s of allStairs){
+    if(!s.vis) continue;
+    const x=s.x*TILE, y=s.y*TILE+PLAY_Y;
+    const isDown = s.dir==='down';
+    const frame = isDown ? '#2a3a6a' : '#6a4a18';
+    const step  = isDown ? P.lblue  : P.yellow;
+    const dark  = isDown ? '#1a2348' : '#3a2810';
+    px(x,y,16,16,P.black);
+    px(x,y,16,16,frame);
+    px(x+1,y+1,14,14,dark);
+    for(let i=0;i<4;i++) px(x+2,y+3+i*3,12-i*2,2,step);
+  }
+  /* arbusto vermelho piscando */
+  if(cur.bush && !rs.bushCut){
+    const b=cur.bush, x=b.x*TILE, y=b.y*TILE+PLAY_Y;
+    const blink=Math.floor(performance.now()/250)%2===0;
+    px(x+2,y+4,12,10,blink?P.red:P.dred);
+    px(x+4,y+2,8,4,blink?P.red:P.dred);
+    px(x+4,y+5,3,3,blink?P.orange:P.red);
+    px(x+9,y+8,3,3,blink?P.orange:P.red);
+  }
+  /* cruz no topo da Igreja (campo1) */
+  if(curName==='campo1'){
+    // Telhado: colunas 2-6 (tx=2..6), linhas 2-3 (ty=2..3)
+    // Centro horizontal: coluna 4 => cx = 4*TILE + 8
+    // Topo do telhado: linha 2 => cy começa em PLAY_Y + 2*TILE
+    const cx = 4*TILE + 8;            // centro x da Igreja (coluna 4, meio do tile)
+    const cy = PLAY_Y + 2*TILE + 1;   // dentro do tile de telhado da linha 2
+    // Haste vertical da cruz
+    px(cx-1, cy,   3, 11, P.yellow);
+    px(cx,   cy+1, 1, 9,  P.white);
+    // Travessão horizontal
+    px(cx-5, cy+3, 11, 3, P.yellow);
+    px(cx-4, cy+4, 9,  1, P.white);
+  }
+  /* cruz no altar */
+  if(curName==='igreja' && flags.crossDelivered){
+    drawCross(7.5*TILE+1, 1*TILE+PLAY_Y+1);
+  }
+  /* itens */
+  for(const it of rs.items){
+    const fy=Math.sin(performance.now()/200)*1.5;
+    if(it.kind==='heart') drawHeart(it.x,it.y+PLAY_Y+fy,false);
+    if(it.kind==='sword') drawSwordItem(it.x,it.y+PLAY_Y+fy,P.lgray);
+    if(it.kind==='bluesword') drawSwordItem(it.x,it.y+PLAY_Y+fy,P.lblue);
+    if(it.kind==='key') drawKey(it.x,it.y+PLAY_Y+fy);
+    if(it.kind==='cross') drawCross(it.x,it.y+PLAY_Y+fy);
+  }
+  /* npcs */
+  if(cur.npcs) for(const n of cur.npcs){
+    if(n.type==='padre') drawPadre(n.x,n.y+PLAY_Y);
+    else drawRainha(n.x,n.y+PLAY_Y);
+  }
+  /* inimigos */
+  for(const e of rs.enemies){
+    if(e.dead) continue;
+    const flick=e.flinch>0 && Math.floor(performance.now()/60)%2===0;
+    if(flick) continue;
+    if(e.type==='bat') drawBat(e.x,e.y+PLAY_Y,e.phase==='move');
+    if(e.type==='goblin') drawGoblin(e.x,e.y+PLAY_Y);
+    if(e.type==='wizard'){
+      if(e.phase==='visible'){
+        const fade=e.visT>3.4 && Math.floor(performance.now()/100)%2===0;
+        if(!fade) drawWizard(e.x,e.y+PLAY_Y);
+      }
+    }
+    if(e.type==='vampire') drawVampire(e.x,e.y+PLAY_Y,e);
+  }
+  /* projeteis */
+  for(const pj of projectiles){
+    const c1=pj.kind==='fire'?P.orange:P.purple, c2=pj.kind==='fire'?P.yellow:P.pink;
+    px(pj.x,pj.y+PLAY_Y,6,6,c1); px(pj.x+1,pj.y+1+PLAY_Y,3,3,c2);
+  }
+  /* jogador */
+  const blinkP = player.invuln>0 && Math.floor(performance.now()/80)%2===0;
+  if(!blinkP) drawHero(player.x,player.y+PLAY_Y);
+  /* particulas */
+  for(const p of particles) px(p.x,p.y+PLAY_Y,p.s,p.s,p.c);
+}
+
+/* --- sprites --- */
+function drawHero(x,y){
+  x=Math.round(x); y=Math.round(y);
+  const step=Math.floor(player.walkAnim)%2===0;
+  // espada durante o golpe
+  if(player.attackT>0 && (flags.hasSword||flags.hasBlueSword)){
+    const sc=flags.hasBlueSword?P.lblue:P.white;
+    if(player.dir==='up'){ px(x+5,y-12,2,12,sc); px(x+3,y-3,6,2,P.yellow);}
+    if(player.dir==='down'){ px(x+5,y+12,2,12,sc); px(x+3,y+13,6,2,P.yellow);}
+    if(player.dir==='left'){ px(x-12,y+6,12,2,sc); px(x-3,y+4,2,6,P.yellow);}
+    if(player.dir==='right'){ px(x+12,y+6,12,2,sc); px(x+13,y+4,2,6,P.yellow);}
+  }
+  // cabelo
+  px(x+2,y-3,8,3,P.dbrown);
+  // rosto
+  px(x+2,y,8,5,P.skin);
+  if(player.dir!=='up'){
+    if(player.dir!=='right') px(x+3,y+1,1,2,P.black);
+    if(player.dir!=='left') px(x+8,y+1,1,2,P.black);
+  } else { px(x+2,y,8,5,P.dbrown); }
+  // tunica verde
+  px(x+1,y+5,10,6,P.green);
+  px(x+1,y+5,10,1,P.lgreen);
+  px(x+0,y+6,2,4,P.green); px(x+10,y+6,2,4,P.green); // bracos
+  px(x+4,y+7,4,1,P.dgreen); // cinto
+  // pernas
+  if(step){ px(x+2,y+11,3,3,P.dbrown); px(x+7,y+11,3,2,P.dbrown); }
+  else { px(x+2,y+11,3,2,P.dbrown); px(x+7,y+11,3,3,P.dbrown); }
+}
+function drawPadre(x,y){
+  x=Math.round(x);y=Math.round(y);
+  px(x+2,y-3,8,3,P.gray);            // cabelo grisalho
+  px(x+2,y,8,5,P.skin);
+  px(x+3,y+1,1,2,P.black); px(x+8,y+1,1,2,P.black);
+  px(x+1,y+5,10,9,P.black);          // batina
+  px(x+5,y+6,2,4,P.white);           // colarinho/estola
+  px(x+4,y+8,4,1,P.yellow);          // cruz pequena
+  px(x+5,y+7,2,3,P.yellow);
+}
+function drawRainha(x,y){
+  x=Math.round(x);y=Math.round(y);
+  px(x+2,y-2,8,2,P.yellow);          // coroa
+  px(x+2,y-4,2,2,P.yellow); px(x+5,y-4,2,2,P.yellow); px(x+8,y-4,2,2,P.yellow);
+  px(x+1,y,10,4,P.brown);            // cabelo
+  px(x+3,y+1,6,4,P.skin);
+  px(x+4,y+2,1,1,P.black); px(x+7,y+2,1,1,P.black);
+  px(x+1,y+5,10,9,P.pink);           // vestido
+  px(x+1,y+12,10,2,P.purple);
+  px(x+5,y+6,2,2,P.white);
+}
+function drawBat(x,y,fly){
+  x=Math.round(x);y=Math.round(y);
+  const w=Math.floor(performance.now()/120)%2===0;
+  const wy=fly&&w?-2:0;
+  px(x-2,y+3+wy,4,4,P.dpurple); px(x+10,y+3+wy,4,4,P.dpurple);    // asas
+  px(x-3,y+4+wy,2,2,P.purple); px(x+13,y+4+wy,2,2,P.purple);
+  px(x+2,y+2,8,7,P.purple);                                        // corpo
+  px(x+3,y+4,2,2,P.red); px(x+7,y+4,2,2,P.red);                    // olhos
+  px(x+4,y+0,1,2,P.purple); px(x+7,y+0,1,2,P.purple);              // orelhas
+}
+function drawGoblin(x,y){
+  x=Math.round(x);y=Math.round(y);
+  const step=Math.floor(performance.now()/300)%2===0;
+  px(x+1,y-1,10,6,P.lgreen);          // cabeca
+  px(x-1,y,2,3,P.lgreen); px(x+11,y,2,3,P.lgreen); // orelhas
+  px(x+3,y+1,2,2,P.red); px(x+7,y+1,2,2,P.red);
+  px(x+4,y+4,4,1,P.dgreen);           // boca
+  px(x+1,y+5,10,6,P.dbrown);          // corpo
+  px(x+2,y+6,8,1,P.brown);
+  if(step){px(x+2,y+11,3,3,P.dgreen);px(x+7,y+11,3,2,P.dgreen);}
+  else{px(x+2,y+11,3,2,P.dgreen);px(x+7,y+11,3,3,P.dgreen);}
+}
+function drawWizard(x,y){
+  x=Math.round(x);y=Math.round(y);
+  px(x+5,y-6,2,3,P.dpurple); px(x+3,y-3,6,3,P.dpurple);  // chapeu
+  px(x+1,y,10,2,P.dpurple);
+  px(x+3,y+2,6,3,P.skin);
+  px(x+4,y+3,1,1,P.yellow); px(x+7,y+3,1,1,P.yellow);
+  px(x+1,y+5,10,9,P.dpurple);        // manto
+  px(x+1,y+5,10,1,P.purple);
+  px(x+10,y+4,2,8,P.brown);          // cajado
+  px(x+9,y+2,4,3,P.pink);
+}
+function drawVampire(x,y,e){
+  x=Math.round(x);y=Math.round(y);
+  const fl=Math.floor(performance.now()/200)%2===0;
+  // capa
+  px(x-2,y+6,26,14,P.dred); px(x-2,y+6,26,2,P.red);
+  // corpo
+  px(x+3,y+8,16,12,P.black);
+  px(x+9,y+9,4,4,P.red);             // medalhao
+  // cabeca
+  px(x+4,y-2,14,10,'#e8e0e8');
+  px(x+3,y-3,16,3,P.black);          // cabelo
+  px(x+3,y-3,3,6,P.black); px(x+16,y-3,3,6,P.black);
+  // olhos malvados
+  px(x+6,y+1,3,2,P.red); px(x+13,y+1,3,2,P.red);
+  px(x+5,y,4,1,P.black); px(x+13,y,4,1,P.black); // sobrancelhas
+  // boca com dentes grandes
+  px(x+6,y+5,10,2,P.dred);
+  px(x+7,y+5,2,3,P.white); px(x+13,y+5,2,3,P.white);
+  if(fl){ px(x-4,y+10,2,6,P.dred); px(x+24,y+10,2,6,P.dred); }
+}
+function drawHeart(x,y,hud){
+  x=Math.round(x);y=Math.round(y);
+  px(x+1,y+1,4,3,P.red); px(x+7,y+1,4,3,P.red);
+  px(x,y+2,12,3,P.red); px(x+1,y+5,10,2,P.red);
+  px(x+3,y+7,6,2,P.red); px(x+5,y+9,2,1,P.red);
+  px(x+2,y+2,2,2,P.pink);
+}
+function drawEmptyHeart(x,y){
+  px(x+1,y+1,4,3,P.dgray); px(x+7,y+1,4,3,P.dgray);
+  px(x,y+2,12,3,P.dgray); px(x+1,y+5,10,2,P.dgray);
+  px(x+3,y+7,6,2,P.dgray); px(x+5,y+9,2,1,P.dgray);
+}
+function drawSwordItem(x,y,c){
+  x=Math.round(x);y=Math.round(y);
+  px(x+6,y,3,9,c); px(x+7,y-2,1,2,c);
+  px(x+4,y+9,7,2,P.yellow); px(x+6,y+11,3,4,P.dbrown);
+  px(x+6,y+1,1,7,P.white);
+}
+function drawKey(x,y){
+  x=Math.round(x);y=Math.round(y);
+  px(x+3,y+1,6,6,P.yellow); px(x+5,y+3,2,2,P.dbrown);
+  px(x+5,y+7,2,7,P.yellow); px(x+7,y+11,3,2,P.yellow); px(x+7,y+13,2,2,P.yellow);
+}
+function drawCross(x,y){
+  x=Math.round(x);y=Math.round(y);
+  px(x+5,y,4,14,P.yellow); px(x+1,y+3,12,4,P.yellow);
+  px(x+6,y+1,1,12,P.white); px(x+2,y+4,10,1,P.white);
+}
+
+/* ---------------- HUD ---------------- */
+function drawHUD(){
+  px(0,0,PXW,HUD_H,P.black);
+  px(0,HUD_H-2,PXW,2,P.dgray);
+  text('VIDA',6,5,P.white,1);
+  for(let i=0;i<player.maxhp;i++){
+    if(i<player.hp) drawHeart(6+i*15,13,true); else drawEmptyHeart(6+i*15,13);
+  }
+  let ix=120;
+  if(flags.hasBlueSword){ drawSwordItem(ix,10,P.lblue); ix+=20; }
+  else if(flags.hasSword){ drawSwordItem(ix,10,P.lgray); ix+=20; }
+  if(flags.hasKey){ drawKey(ix,9); ix+=20; }
+  if(flags.hasCross){ drawCross(ix,9); ix+=20; }
+  // hp do chefe
+  const rs=roomState[curName];
+  if(cur && cur.boss && rs){
+    const v=rs.enemies.find(e=>e.type==='vampire');
+    if(v && !v.dead){
+      text('VAMPIRAO',170,5,P.red,1);
+      px(170,14,48,6,P.dgray);
+      px(171,15,Math.max(0,Math.floor(46*v.hp/8)),4,P.red);
+    }
+  }
+}
+
+/* ---------------- TEXTO 8-BITS ---------------- */
+const FONT={
+ 'A':["01110","10001","11111","10001","10001"],
+ 'B':["11110","10001","11110","10001","11110"],
+ 'C':["01111","10000","10000","10000","01111"],
+ 'D':["11110","10001","10001","10001","11110"],
+ 'E':["11111","10000","11110","10000","11111"],
+ 'F':["11111","10000","11110","10000","10000"],
+ 'G':["01111","10000","10111","10001","01111"],
+ 'H':["10001","10001","11111","10001","10001"],
+ 'I':["11111","00100","00100","00100","11111"],
+ 'J':["00111","00010","00010","10010","01100"],
+ 'K':["10001","10010","11100","10010","10001"],
+ 'L':["10000","10000","10000","10000","11111"],
+ 'M':["10001","11011","10101","10001","10001"],
+ 'N':["10001","11001","10101","10011","10001"],
+ 'O':["01110","10001","10001","10001","01110"],
+ 'P':["11110","10001","11110","10000","10000"],
+ 'Q':["01110","10001","10001","10010","01101"],
+ 'R':["11110","10001","11110","10010","10001"],
+ 'S':["01111","10000","01110","00001","11110"],
+ 'T':["11111","00100","00100","00100","00100"],
+ 'U':["10001","10001","10001","10001","01110"],
+ 'V':["10001","10001","10001","01010","00100"],
+ 'W':["10001","10001","10101","11011","10001"],
+ 'X':["10001","01010","00100","01010","10001"],
+ 'Y':["10001","01010","00100","00100","00100"],
+ 'Z':["11111","00010","00100","01000","11111"],
+ '0':["01110","10011","10101","11001","01110"],
+ '1':["00100","01100","00100","00100","01110"],
+ '2':["01110","10001","00010","00100","11111"],
+ '3':["11110","00001","00110","00001","11110"],
+ '4':["00010","00110","01010","11111","00010"],
+ '5':["11111","10000","11110","00001","11110"],
+ '6':["01110","10000","11110","10001","01110"],
+ '7':["11111","00001","00010","00100","00100"],
+ '8':["01110","10001","01110","10001","01110"],
+ '9':["01110","10001","01111","00001","01110"],
+ '!':["00100","00100","00100","00000","00100"],
+ '?':["01110","10001","00010","00000","00100"],
+ '.':["00000","00000","00000","00000","00100"],
+ ',':["00000","00000","00000","00100","01000"],
+ '-':["00000","00000","01110","00000","00000"],
+ ':':["00000","00100","00000","00100","00000"],
+ "'":["00100","00100","00000","00000","00000"],
+ '>':["01000","00100","00010","00100","01000"],
+ ' ':["00000","00000","00000","00000","00000"]
+};
+function text(str,x,y,c,scale){
+  scale=scale||1; ctx.fillStyle=c;
+  str=str.toUpperCase();
+  let cx=x;
+  for(const ch of str){
+    const g=FONT[ch]||FONT['?'];
+    for(let ry=0;ry<5;ry++){
+      const row=g[ry];
+      for(let rx=0;rx<5;rx++){
+        if(row[rx]==='1') ctx.fillRect(cx+rx*scale, y+ry*scale, scale, scale);
+      }
+    }
+    cx+=6*scale;
+  }
+}
+function textCenter(str,y,c,scale){
+  scale=scale||1;
+  const w=str.length*6*scale-scale;
+  text(str,(PXW-w)/2,y,c,scale);
+}
+
+/* ---------------- TELAS ---------------- */
+function drawTitle(dt){
+  titleBlink+=dt;
+  // ceu
+  px(0,0,PXW,90,'#1c1c4c');
+  px(0,0,PXW,40,'#101034');
+  // estrelas
+  for(let i=0;i<18;i++){
+    const sx=(i*53)%PXW, sy=(i*37)%70;
+    if(Math.floor(performance.now()/600+i)%4!==0) px(sx,sy,1,1,P.white);
+  }
+  // lua
+  px(200,18,18,18,P.cream); px(204,22,5,5,'#1c1c4c');
+  // montanhas
+  for(let i=0;i<5;i++){
+    const bx=i*60-20;
+    for(let r=0;r<28;r++) px(bx+r, 90-r, (56-2*r), 1, '#3a3a52');
+    px(bx+22,64,12,4,P.white);
+  }
+  // floresta
+  px(0,90,PXW,30,P.dgreen);
+  for(let i=0;i<24;i++){
+    const tx=i*11+((i%2)*4);
+    px(tx,84+(i%3)*3,9,16,P.dgreen);
+    px(tx+2,80+(i%3)*3,5,8,P.green);
+  }
+  // vale
+  px(0,120,PXW,120,P.grass);
+  for(let i=0;i<30;i++){ px((i*41)%PXW,(125+(i*17)%100),2,2,P.grass2); }
+  // rocha com espada
+  px(108,168,40,26,P.gray); px(112,164,32,8,P.gray);
+  px(110,170,10,6,P.lgray); px(132,180,8,6,P.dgray);
+  px(126,128,4,40,P.lgray); px(127,130,1,36,P.white);     // lamina
+  px(118,138,20,4,P.yellow);                              // guarda
+  px(126,124,4,6,P.dbrown);                               // punho... acima
+  px(125,120,6,5,P.dbrown);
+  // brilho
+  if(Math.floor(performance.now()/500)%3===0){ px(122,132,2,2,P.white); px(133,150,2,2,P.white);}
+  // titulo
+  textCenter('REI E RAINHA',34,P.black,3);
+  textCenter('REI E RAINHA',32,P.yellow,3);
+  // prompt
+  if(Math.floor(titleBlink*2)%2===0)
+    textCenter('APERTE O BOTAO PARA INICIAR',206,P.white,1);
+  textCenter('PAPA BAND BR APRESENTA - 2026',222,P.white,1);
+}
+
+function drawDialogBox(){
+  const lines=wrapText(dialog.pages[dialog.idx],28);
+  const h=14+lines.length*9;
+  px(8,PXH-h-8,PXW-16,h,P.black);
+  ctx.strokeStyle=P.white; ctx.lineWidth=1;
+  ctx.strokeRect(9.5,PXH-h-6.5,PXW-19,h-3);
+  const shown=Math.floor(dialog.char);
+  let remaining=shown;
+  for(let i=0;i<lines.length;i++){
+    const l=lines[i];
+    const take=Math.max(0,Math.min(l.length,remaining));
+    remaining-=take;
+    text(l.slice(0,take),16,PXH-h+2+i*9,P.white,1);
+  }
+  const total=lines.join('').length;
+  if(shown>=total && Math.floor(performance.now()/300)%2===0){
+    text('>',PXW-24,PXH-16,P.white,1);
+  }
+}
+
+function drawGameOver(){
+  px(0,0,PXW,PXH,P.black);
+  textCenter('GAME OVER',46,P.red,2);
+  const msg=wrapText('VOCE FOI DERROTADO. O VAMPIRAO VENCEU E AS TREVAS TOMARAM CONTA DO SEU REINO.',26);
+  msg.forEach((l,i)=>textCenter(l,84+i*11,P.white,1));
+  
+  if(gameOverPhase===0){
+    // Fase 1: mostra apenas mensagem com prompt para continuar
+    if(Math.floor(performance.now()/500)%2===0)
+      textCenter('APERTE O BOTAO',160,P.gray,1);
+  } else {
+    // Fase 2: mostra pergunta e opções
+    textCenter('TENTAR NOVAMENTE?',150,P.yellow,1);
+    const simC = gameOverSel===0?P.white:P.gray;
+    const naoC = gameOverSel===1?P.white:P.gray;
+    textCenter('SIM',176,simC,1);
+    textCenter('NAO',196,naoC,1);
+    const cy = gameOverSel===0?176:196;
+    text('>',104,cy,P.yellow,1);
+  }
+}
+
+function drawEnding(){
+  px(0,0,PXW,PXH,P.black);
+  px(0,150,PXW,90,P.grass);
+  for(let i=0;i<12;i++) px((i*29)%PXW,156+(i*13)%70,2,2,P.grass2);
+  // heroi e rainha juntos
+  const ox=108, oy=120;
+  drawHeroAt(ox,oy);
+  drawRainhaAt(ox+24,oy);
+  drawCross((PXW-14)/2,70);
+  drawHeart(ox+14,oy-18,false);
+  textCenter('FIM',36,P.yellow,3);
+  textCenter('O REINO ESTA EM PAZ',200,P.white,1);
+  if(Math.floor(performance.now()/500)%2===0)
+    textCenter('OBRIGADO POR JOGAR!',216,P.lgreen,1);
+}
+function drawHeroAt(x,y){
+  px(x+2,y-3,8,3,P.dbrown); px(x+2,y,8,5,P.skin);
+  px(x+3,y+1,1,2,P.black); px(x+8,y+1,1,2,P.black);
+  px(x+1,y+5,10,6,P.green); px(x+1,y+5,10,1,P.lgreen);
+  px(x+2,y+11,3,3,P.dbrown); px(x+7,y+11,3,3,P.dbrown);
+}
+function drawRainhaAt(x,y){
+  px(x+2,y-2,8,2,P.yellow); px(x+2,y-4,2,2,P.yellow); px(x+5,y-4,2,2,P.yellow); px(x+8,y-4,2,2,P.yellow);
+  px(x+1,y,10,4,P.brown); px(x+3,y+1,6,4,P.skin);
+  px(x+4,y+2,1,1,P.black); px(x+7,y+2,1,1,P.black);
+  px(x+1,y+5,10,9,P.pink); px(x+1,y+12,10,2,P.purple);
+}
+
+/* ---------------- LOOP ---------------- */
+function resetGame(){
+  for(const k in roomState) delete roomState[k];
+  for(const k in flags) flags[k]=false;
+  player.hp=3; player.dir='down'; player.invuln=0; player.attackT=0; player.kbT=0;
+  projectiles=[]; particles=[];
+  enterRoom('campo1',4,9);
+}
+
+function frame(t){
+  const dt=Math.min(0.05,(t-lastT)/1000); lastT=t;
+  readInputGlobal:;
+  if(state==='title'){
+    readInput();
+    drawTitle(dt);
+    if(startPressed){ resetGame(); state='play'; }
+  }
+  else if(state==='play'){
+    update(dt);
+    px(0,0,PXW,PXH,P.black);
+    drawRoom();
+    drawHUD();
+  }
+  else if(state==='dialog'){
+    readInput();
+    px(0,0,PXW,PXH,P.black);
+    drawRoom();
+    drawHUD();
+    const lines=wrapText(dialog.pages[dialog.idx],28);
+    const total=lines.join('').length;
+    if(dialog.char<total){
+      const before=Math.floor(dialog.char);
+      dialog.char+=dt*40;
+      if(Math.floor(dialog.char)>before && Math.floor(dialog.char)%3===0) sfxText();
+      if(actionPressed) dialog.char=total;
+    } else if(actionPressed){
+      dialog.idx++;
+      dialog.char=0;
+      if(dialog.idx>=dialog.pages.length){
+        const cb=dialog.onDone; dialog=null;
+        state='play';
+        if(cb) cb();
+      }
+    }
+    if(dialog) drawDialogBox();
+  }
+  else if(state==='dying'){
+    // Estado intermediário: toca o som de falha e aguarda ~1 segundo antes do Game Over
+    readInput();
+    dyingTimer-=dt;
+    // Continua desenhando a sala (herói já invisível pelo invuln)
+    px(0,0,PXW,PXH,P.black);
+    drawRoom();
+    drawHUD();
+    // Tela escurece progressivamente
+    const alpha=Math.min(0.8, 1.0 - (dyingTimer/1.05));
+    ctx.fillStyle=`rgba(0,0,0,${alpha})`;
+    ctx.fillRect(0,0,PXW,PXH);
+    if(dyingTimer<=0){
+      state='gameover'; gameOverPhase=0; gameOverSel=0; goNavLock=true;
+    }
+  }
+  else if(state==='gameover'){
+    const inp=readInput();
+    drawGameOver();
+    if(gameOverPhase===0){
+      // Fase 1: aguardando primeiro apertar de botão
+      if(startPressed){
+        gameOverPhase=1;
+        goNavLock=true;
+      }
+    } else {
+      // Fase 2: navegação e seleção
+      if(inp.up||inp.dn){
+        if(!goNavLock){ gameOverSel = gameOverSel===0?1:0; goNavLock=true; sfxText(); }
+      } else goNavLock=false;
+      if(startPressed){
+        if(gameOverSel===0){ resetGame(); state='play'; }
+        else { state='title'; setMusic('title'); titleBlink=0; }
+      }
+    }
+  }
+  else if(state==='ending'){
+    readInput();
+    drawEnding();
+  }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
